@@ -201,11 +201,11 @@ main() {
     head_branches=$(unique_words $head_branches_raw)
     pr_ids_for_base=$(unique_words $pr_ids_raw)
 
-    printf '--------------------------------------------------\n'
+    printf '%s\n' '--------------------------------------------------'
     printf 'Rebuilding party branch for base: %s\n' "$base_branch_name"
     printf '  Party branch: %s\n' "$party_branch_name"
     printf '  PRs: %s\n' "$pr_ids_for_base"
-    printf '--------------------------------------------------\n'
+    printf '%s\n' '--------------------------------------------------'
 
     # Minimal debug: show working tree status before we wipe it.
     shell "git status --short || true"
@@ -243,13 +243,13 @@ main() {
     done
 
     if ((${#conflicting_branches[@]} > 0)); then
-      printf '==================================================\n'
+      printf '%s\n' '=================================================='
       printf 'WARNING: The following PR branches were SKIPPED\n'
       printf '         from %s due to merge conflicts:\n' "$party_branch_name"
       for label in "${conflicting_branches[@]}"; do
         printf '  - %s\n' "$label"
       done
-      printf '==================================================\n'
+      printf '%s\n' '=================================================='
     fi
 
     # Force push party branch for this base.
