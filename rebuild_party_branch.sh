@@ -82,11 +82,18 @@ fetch_open_prs() {
   local all_prs='[]'
 
   while [[ -n "$url" ]]; do
-    local page_json
+    local page_json values_json
     page_json=$(bitbucket_api_get "$url" "$username" "$app_password")
 
-    # Accumulate .values entries into all_prs.
-    all_prs=$(jq -c --argjson acc "$all_prs" '($acc + (.values // []))' <<<"$page_json")
+    # Extract this page's values as an array.
+    values_json=$(jq -c '.values // []' <<<"$page_json")
+
+    # Accumulate arrays without passing large JSON blobs as single arguments.
+    all_prs=$(
+      jq -sc 'add' \
+        <(printf '%s\n' "$all_prs") \
+        <(printf '%s\n' "$values_json")
+    )
 
     # Follow pagination.
     url=$(jq -r '.next // empty' <<<"$page_json")
