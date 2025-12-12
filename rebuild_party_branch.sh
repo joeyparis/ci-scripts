@@ -119,7 +119,7 @@ unique_words() {
 
 party_branch_name_for_base() {
   local base_branch="$1"
-  printf 'party/%s-qa\n' "$base_branch"
+  printf 'party/%s\n' "$base_branch"
 }
 
 main() {
@@ -195,6 +195,10 @@ main() {
   shell "git fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune"
 
   for base_branch_name in "${target_bases[@]}"; do
+    if [[ "$base_branch_name" == party/* ]]; then
+      printf 'Skipping base branch %s because it is already a party branch.\n' "$base_branch_name"
+      continue
+    fi
     local party_branch_name
     party_branch_name=$(party_branch_name_for_base "$base_branch_name")
 
