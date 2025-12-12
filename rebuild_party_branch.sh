@@ -136,6 +136,13 @@ main() {
   printf 'Workspace:    %s\n' "$workspace"
   printf 'Repo slug:    %s\n' "$repo_slug"
 
+  # Prevent infinite loops: Do not run this script if we are already on a party branch.
+  # This script pushes to party branches, which would trigger the pipeline again.
+  if [[ "${BITBUCKET_BRANCH:-}" == party/* ]]; then
+    printf 'Skipping rebuild because we are already on a party branch: %s\n' "$BITBUCKET_BRANCH"
+    exit 0
+  fi
+
   local prs_json
   prs_json=$(fetch_open_prs "$workspace" "$repo_slug" "$username" "$app_password")
 
