@@ -310,7 +310,7 @@ upsert_party_conflict_comment() {
   local conflict_context_md=''
   if ((${#conflicts[@]} > 0)); then
     local -i total_lines=0
-    local file block remaining per_file_lines block_lines
+    local file block remaining per_file_lines block_lines conflict_start
 
     for file in "${conflicts[@]}"; do
       remaining=$((max_total_lines - total_lines))
@@ -323,12 +323,24 @@ upsert_party_conflict_comment() {
         per_file_lines=$remaining
       fi
 
+      conflict_start=$(awk 'index($0, "<<<<<<<") == 1 { print NR; exit }' "$file" 2>/dev/null || true)
       block=$(first_merge_conflict_snippet_for_file "$file" "$per_file_lines" || true)
 
       if [[ -n "$block" ]]; then
-        conflict_context_md+=$'\n'"**\`$file\`**"$'\n\n'"```text"$'\n'"$block"$'\n'"```"$'\n'
+        conflict_context_md+=$'\n'"**\`$file\`**"
+        if [[ -n "$conflict_start" ]]; then
+          conflict_context_md+=" (around line $conflict_start)"
+        fi
+        conflict_context_md+=$'\n\n'
+
+        # Use indented code blocks (classic Markdown) for maximum compatibility.
+        local indented='' line
+        while IFS= read -r line; do
+          indented+="    ${line}"$'\n'
+        done <<<"$block"
+        conflict_context_md+="$indented"$'\n'
       else
-        conflict_context_md+=$'\n'"**\`$file\`**"$'\n\n'"_(Unable to extract conflict markers from this file; see CI logs.)_"$'\n'
+        conflict_context_md+=$'\n'"**\`$file\`**"$'\n\n'"_(Unable to extract conflict markers from this file (some conflict types don\x27t include inline markers); see CI logs.)_"$'\n'
       fi
 
       block_lines=$(printf '%s' "$block" | awk 'END{print NR}')
@@ -352,9 +364,11 @@ upsert_party_conflict_comment() {
       "- Time (UTC): \`$now\`" \
       '' \
       'Conflicting files:' \
+      '' \
       "${conflicts_md:-_Unable to determine conflicting files; see CI logs for details._}" \
       '' \
       'Conflict context (first conflict per file):' \
+      '' \
       "${conflict_context_md:-_Unable to extract conflict context; see CI logs for details._}" \
       '' \
       'Please resolve conflicts by updating the PR branch so it can be included in the party branch.' \
