@@ -178,8 +178,90 @@ strikeout_markdown_lines() {
   printf '%s' "$out"
 }
 
+first_merge_conflict_snippet_for_file() {
+  # Usage: first_merge_conflict_snippet_for_file <file_path> <max_lines>
+  # Extracts the first conflict-marker block (<<<<<<< ... >>>>>>>) from the working tree file,
+  # including a few context lines around it and prefixing lines with their line numbers.
+  #
+  # Tunables:
+  #   REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_BEFORE (default: 3)
+  #   REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_AFTER  (default: 3)
+  local file_path="$1"
+  local max_lines="$2"
+
+  [[ -f "$file_path" ]] || return 0
+
+  local before after
+  before=${REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_BEFORE:-3}
+  after=${REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_AFTER:-3}
+
+  awk -v max="$max_lines" -v before="$before" -v after="$after" '
+    function push(num, line) {
+      # Keep only the last "before" lines.
+      if (before <= 0) return
+      if (q_size >= before) {
+        for (i = 1; i < q_size; i++) { q_num[i] = q_num[i+1]; q_line[i] = q_line[i+1] }
+        q_size--
+      }
+      q_size++
+      q_num[q_size] = num
+      q_line[q_size] = line
+    }
+
+    function print_line(num, line) {
+      if (printed >= max) return
+      printf "%6d|%s\n", num, line
+      printed++
+    }
+
+    BEGIN {
+      found = 0
+      printed = 0
+      q_size = 0
+      after_left = -1
+    }
+
+    {
+      if (found == 0) {
+        if (index($0, "<<<<<<<") == 1) {
+          found = 1
+          # Print buffered context-before lines.
+          for (i = 1; i <= q_size; i++) {
+            print_line(q_num[i], q_line[i])
+          }
+          # Print the conflict start line.
+          print_line(NR, $0)
+          next
+        }
+        push(NR, $0)
+        next
+      }
+
+      # We are in the conflict block (or immediately after it for context-after).
+      print_line(NR, $0)
+
+      if (after_left == -1 && index($0, ">>>>>>>") == 1) {
+        after_left = after
+        next
+      }
+
+      if (after_left >= 0) {
+        after_left--
+        if (after_left < 0) {
+          exit
+        }
+      }
+
+      if (printed >= max) {
+        exit
+      }
+    }
+  ' "$file_path"
+}
+
 upsert_party_conflict_comment() {
-  # Usage: upsert_party_conflict_comment <workspace> <repo_slug> <username> <app_password> <pr_id> <base_branch> <party_branch> <source_branch> <merge_ref>
+  # Usage: upsert_party_conflict_comment <workspace> <repo_slug> <username> <app_password> <pr_id> <base_branch> <party_branch> <source_branch> <merge_ref> <conflict_files>
+  # conflict_files should be a newline-separated list of file paths (typically from: git diff --name-only --diff-filter=U)
   local workspace="$1"
   local repo_slug="$2"
   local username="$3"
@@ -189,10 +271,74 @@ upsert_party_conflict_comment() {
   local party_branch="$7"
   local source_branch="$8"
   local merge_ref="$9"
+  local conflict_files="${10:-}"
 
   local marker now
   marker=$(party_conflict_comment_marker)
   now=$(now_utc)
+
+  # Render up to 25 conflicting files to keep comments readable.
+  local conflicts_md=''
+  local -a conflicts=()
+  if [[ -n "$conflict_files" ]]; then
+    local -i count=0
+    local f
+    while IFS= read -r f; do
+      [[ -z "$f" ]] && continue
+      conflicts+=("$f")
+    done <<<"$conflict_files"
+
+    for f in "${conflicts[@]}"; do
+      count=$((count + 1))
+      if ((count > 25)); then
+        break
+      fi
+      conflicts_md+="- \`$f\`"$'\n'
+    done
+
+    if ((${#conflicts[@]} > 25)); then
+      conflicts_md+="- _(and $(( ${#conflicts[@]} - 25 )) more...)_"$'\n'
+    fi
+  fi
+
+  # Include a small snippet of conflict context (first conflict per file), capped by lines.
+  # Tune via env vars to avoid giant PR comments.
+  local max_total_lines max_lines_per_file
+  max_total_lines=${REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_MAX_LINES:-120}
+  max_lines_per_file=${REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_MAX_LINES_PER_FILE:-40}
+
+  local conflict_context_md=''
+  if ((${#conflicts[@]} > 0)); then
+    local -i total_lines=0
+    local file block remaining per_file_lines block_lines
+
+    for file in "${conflicts[@]}"; do
+      remaining=$((max_total_lines - total_lines))
+      if ((remaining <= 0)); then
+        break
+      fi
+
+      per_file_lines=$max_lines_per_file
+      if ((per_file_lines > remaining)); then
+        per_file_lines=$remaining
+      fi
+
+      block=$(first_merge_conflict_snippet_for_file "$file" "$per_file_lines" || true)
+
+      if [[ -n "$block" ]]; then
+        conflict_context_md+=$'\n'"**\`$file\`**"$'\n\n'"```text"$'\n'"$block"$'\n'"```"$'\n'
+      else
+        conflict_context_md+=$'\n'"**\`$file\`**"$'\n\n'"_(Unable to extract conflict markers from this file; see CI logs.)_"$'\n'
+      fi
+
+      block_lines=$(printf '%s' "$block" | awk 'END{print NR}')
+      total_lines=$((total_lines + block_lines))
+    done
+
+    if ((total_lines >= max_total_lines)); then
+      conflict_context_md+=$'\n'"_(Conflict context truncated at ${max_total_lines} line(s). Set REBUILD_PARTY_BRANCH_CONFLICT_CONTEXT_MAX_LINES / _MAX_LINES_PER_FILE to adjust.)_"$'\n'
+    fi
+  fi
 
   local comment_body
   comment_body=$(
@@ -204,6 +350,12 @@ upsert_party_conflict_comment() {
       "- Source branch: \`$source_branch\`" \
       "- Merge ref: \`$merge_ref\`" \
       "- Time (UTC): \`$now\`" \
+      '' \
+      'Conflicting files:' \
+      "${conflicts_md:-_Unable to determine conflicting files; see CI logs for details._}" \
+      '' \
+      'Conflict context (first conflict per file):' \
+      "${conflict_context_md:-_Unable to extract conflict context; see CI logs for details._}" \
       '' \
       'Please resolve conflicts by updating the PR branch so it can be included in the party branch.' \
       '' \
@@ -477,6 +629,9 @@ main() {
         printf 'Skipping %s for this run due to conflict.\n' "$label" >&2
 
         # Only comment when Git indicates actual file-level merge conflicts.
+        local conflict_files
+        conflict_files=$(git --no-pager diff --name-only --diff-filter=U 2>/dev/null || true)
+
         if [[ -n "$pr_id_for_branch" ]] && [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
           upsert_party_conflict_comment \
             "$workspace" \
@@ -487,7 +642,8 @@ main() {
             "$base_branch_name" \
             "$party_branch_name" \
             "$head_branch" \
-            "$merge_ref" || true
+            "$merge_ref" \
+            "$conflict_files" || true
         fi
 
         # Do not blow up the whole pipeline; abort the merge and continue.
