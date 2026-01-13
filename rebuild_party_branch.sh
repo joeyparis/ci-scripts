@@ -622,65 +622,115 @@ main() {
     # checkout/reset party branch from origin/<base>
     shell "git checkout -B '$party_branch_name' 'origin/$base_branch_name'"
 
-    # Merge each head branch into the party branch, skipping conflicts.
-    local -a conflicting_branches=()
+    # Merge each head branch into the party branch.
+    #
+    # To maximize inclusion, do multiple passes:
+    # - Attempt to merge all PR branches.
+    # - If some conflict, skip them for the moment.
+    # - After other branches land, retry the conflicters (sometimes the conflicts disappear).
+    #
+    # Tunable:
+    #   REBUILD_PARTY_BRANCH_MAX_MERGE_PASSES (default: 5)
+    local -i max_merge_passes
+    max_merge_passes=${REBUILD_PARTY_BRANCH_MAX_MERGE_PASSES:-5}
+    if ((max_merge_passes < 1)); then
+      max_merge_passes=1
+    fi
+
+    local -a pending_head_branches=()
+    if [[ -n "$head_branches" ]]; then
+      # shellcheck disable=SC2206
+      pending_head_branches=($head_branches)
+    fi
+
+    local -i pass_num=0
     local head_branch merge_ref pr_id_for_branch label
 
-    for head_branch in $head_branches; do
-      merge_ref="origin/${head_branch}"
-      pr_id_for_branch=${branch_to_pr_id["$head_branch"]:-}
-
-      if [[ -n "$pr_id_for_branch" ]]; then
-        label="PR #${pr_id_for_branch} (${merge_ref})"
-      else
-        label="$merge_ref"
+    while ((${#pending_head_branches[@]} > 0)); do
+      pass_num=$((pass_num + 1))
+      if ((pass_num > max_merge_passes)); then
+        printf 'Reached max merge passes (%d); leaving %d branch(es) unmerged for %s.\n' \
+          "$max_merge_passes" "${#pending_head_branches[@]}" "$party_branch_name" >&2
+        break
       fi
 
-      printf 'Merging %s into %s...\n' "$label" "$party_branch_name"
+      printf 'Merge pass %d/%d (%d branch(es) pending) for %s\n' \
+        "$pass_num" "$max_merge_passes" "${#pending_head_branches[@]}" "$party_branch_name"
 
-      if ! shell_allow_fail "git merge --no-ff --no-edit '$merge_ref'"; then
-        printf 'Merge conflict when merging %s: see git output above.\n' "$label" >&2
-        printf 'Skipping %s for this run due to conflict.\n' "$label" >&2
+      local -i merged_this_pass=0
+      local -a next_pending=()
 
-        # Only comment when Git indicates actual file-level merge conflicts.
-        local conflict_files
-        conflict_files=$(git --no-pager diff --name-only --diff-filter=U 2>/dev/null || true)
+      for head_branch in "${pending_head_branches[@]}"; do
+        merge_ref="origin/${head_branch}"
+        pr_id_for_branch=${branch_to_pr_id["$head_branch"]:-}
 
-        if [[ -n "$pr_id_for_branch" ]] && [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
-          upsert_party_conflict_comment \
-            "$workspace" \
-            "$repo_slug" \
-            "$username" \
-            "$app_password" \
-            "$pr_id_for_branch" \
-            "$base_branch_name" \
-            "$party_branch_name" \
-            "$head_branch" \
-            "$merge_ref" \
-            "$conflict_files" || true
-        fi
-
-        # Do not blow up the whole pipeline; abort the merge and continue.
-        git merge --abort || true
-        conflicting_branches+=("$label")
-      else
         if [[ -n "$pr_id_for_branch" ]]; then
-          resolve_party_conflict_comment_if_present \
-            "$workspace" \
-            "$repo_slug" \
-            "$username" \
-            "$app_password" \
-            "$pr_id_for_branch" \
-            "$party_branch_name" || true
+          label="PR #${pr_id_for_branch} (${merge_ref})"
+        else
+          label="$merge_ref"
         fi
+
+        printf 'Merging %s into %s...\n' "$label" "$party_branch_name"
+
+        if ! shell_allow_fail "git merge --no-ff --no-edit '$merge_ref'"; then
+          printf 'Merge conflict when merging %s: see git output above.\n' "$label" >&2
+          printf 'Deferring %s for retry due to conflict.\n' "$label" >&2
+
+          # Only comment when Git indicates actual file-level merge conflicts.
+          local conflict_files
+          conflict_files=$(git --no-pager diff --name-only --diff-filter=U 2>/dev/null || true)
+
+          if [[ -n "$pr_id_for_branch" ]] && [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
+            upsert_party_conflict_comment \
+              "$workspace" \
+              "$repo_slug" \
+              "$username" \
+              "$app_password" \
+              "$pr_id_for_branch" \
+              "$base_branch_name" \
+              "$party_branch_name" \
+              "$head_branch" \
+              "$merge_ref" \
+              "$conflict_files" || true
+          fi
+
+          # Abort the merge and try the next branch.
+          git merge --abort || true
+          next_pending+=("$head_branch")
+        else
+          merged_this_pass=$((merged_this_pass + 1))
+          if [[ -n "$pr_id_for_branch" ]]; then
+            resolve_party_conflict_comment_if_present \
+              "$workspace" \
+              "$repo_slug" \
+              "$username" \
+              "$app_password" \
+              "$pr_id_for_branch" \
+              "$party_branch_name" || true
+          fi
+        fi
+      done
+
+      pending_head_branches=("${next_pending[@]}")
+
+      if ((merged_this_pass == 0)); then
+        # No progress means the remaining branches conflict against the current party branch state.
+        break
       fi
     done
 
-    if ((${#conflicting_branches[@]} > 0)); then
+    if ((${#pending_head_branches[@]} > 0)); then
       printf '%s\n' '=================================================='
       printf 'WARNING: The following PR branches were SKIPPED\n'
       printf '         from %s due to merge conflicts:\n' "$party_branch_name"
-      for label in "${conflicting_branches[@]}"; do
+      for head_branch in "${pending_head_branches[@]}"; do
+        merge_ref="origin/${head_branch}"
+        pr_id_for_branch=${branch_to_pr_id["$head_branch"]:-}
+        if [[ -n "$pr_id_for_branch" ]]; then
+          label="PR #${pr_id_for_branch} (${merge_ref})"
+        else
+          label="$merge_ref"
+        fi
         printf '  - %s\n' "$label"
       done
       printf '%s\n' '=================================================='
