@@ -259,6 +259,151 @@ first_merge_conflict_snippet_for_file() {
   ' "$file_path"
 }
 
+auto_resolve_empty_side_conflict_markers() {
+  # Usage: auto_resolve_empty_side_conflict_markers <file_path>
+  # If ALL conflict blocks in the file are trivial (one side is blank/whitespace-only),
+  # rewrite the file choosing the non-empty side for each block.
+  # Returns 0 if it resolved; 1 if not applicable/unsafe.
+  local file_path="$1"
+
+  [[ -f "$file_path" ]] || return 1
+  grep -q '^<<<<<<<' "$file_path" 2>/dev/null || return 1
+
+  local tmp
+  tmp="${file_path}.rebuild_party_branch_resolved.$$"
+
+  if ! awk '
+    function is_blank(s) {
+      gsub(/[ \t\r\n]/, "", s)
+      return length(s) == 0
+    }
+
+    BEGIN {
+      in_conflict = 0
+      side = 0
+      ours = ""
+      theirs = ""
+    }
+
+    /^<<<<<<</ {
+      if (in_conflict) {
+        exit 2
+      }
+      in_conflict = 1
+      side = 2
+      ours = ""
+      theirs = ""
+      next
+    }
+
+    in_conflict && /^=======$/ {
+      side = 3
+      next
+    }
+
+    in_conflict && /^>>>>>>>/ {
+      if (is_blank(ours) && !is_blank(theirs)) {
+        printf "%s", theirs
+      } else if (!is_blank(ours) && is_blank(theirs)) {
+        printf "%s", ours
+      } else {
+        exit 3
+      }
+      in_conflict = 0
+      side = 0
+      next
+    }
+
+    {
+      if (!in_conflict) {
+        print
+        next
+      }
+
+      if (side == 2) {
+        ours = ours $0 ORS
+        next
+      }
+
+      if (side == 3) {
+        theirs = theirs $0 ORS
+        next
+      }
+
+      exit 4
+    }
+
+    END {
+      if (in_conflict) {
+        exit 5
+      }
+    }
+  ' "$file_path" >"$tmp"; then
+    rm -f "$tmp" || true
+    return 1
+  fi
+
+  mv "$tmp" "$file_path"
+  return 0
+}
+
+try_auto_resolve_trivial_merge_conflicts() {
+  # Usage: try_auto_resolve_trivial_merge_conflicts
+  # Attempts to resolve trivial conflict types without human input:
+  # - Text conflicts where one side of EACH conflict block is blank/whitespace-only
+  # - Delete/modify-ish cases where only one side (ours/theirs) exists in the index
+  # Returns 0 if it resolved ALL current conflicts and completed the merge commit.
+  local conflict_files
+  conflict_files=$(git --no-pager diff --name-only --diff-filter=U 2>/dev/null || true)
+  [[ -n "$conflict_files" ]] || return 1
+
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+
+    # 1) Inline conflict markers: choose the non-empty side, but only if every block is trivial.
+    if auto_resolve_empty_side_conflict_markers "$f"; then
+      git add "$f" || return 1
+      continue
+    fi
+
+    # 2) If only one stage exists (ours XOR theirs), pick it.
+    local stages has_ours has_theirs
+    stages=$(git ls-files -u -- "$f" 2>/dev/null | awk '{print $3}' | sort -u || true)
+    has_ours=0
+    has_theirs=0
+    grep -qx '2' <<<"$stages" && has_ours=1 || true
+    grep -qx '3' <<<"$stages" && has_theirs=1 || true
+
+    if ((has_ours == 1 && has_theirs == 0)); then
+      git checkout --ours -- "$f" || return 1
+      git add "$f" || return 1
+      continue
+    fi
+
+    if ((has_ours == 0 && has_theirs == 1)); then
+      git checkout --theirs -- "$f" || return 1
+      git add "$f" || return 1
+      continue
+    fi
+
+    # Not trivial/safe.
+    return 1
+  done <<<"$conflict_files"
+
+  # If anything is still unmerged, bail.
+  if [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
+    return 1
+  fi
+
+  # Complete the merge commit using the default merge message.
+  if ! git commit --no-edit >/dev/null 2>&1; then
+    return 1
+  fi
+
+  return 0
+}
+
 upsert_party_conflict_comment() {
   # Usage: upsert_party_conflict_comment <workspace> <repo_slug> <username> <app_password> <pr_id> <base_branch> <party_branch> <source_branch> <merge_ref> <conflict_files>
   # conflict_files should be a newline-separated list of file paths (typically from: git diff --name-only --diff-filter=U)
@@ -673,6 +818,27 @@ main() {
         printf 'Merging %s into %s...\n' "$label" "$party_branch_name"
 
         if ! shell_allow_fail "git merge --no-ff --no-edit '$merge_ref'"; then
+          # Optional: auto-resolve trivial conflicts to maximize inclusion.
+          #
+          # Tunable:
+          #   REBUILD_PARTY_BRANCH_AUTO_RESOLVE_TRIVIAL_CONFLICTS (default: 1)
+          if [[ "${REBUILD_PARTY_BRANCH_AUTO_RESOLVE_TRIVIAL_CONFLICTS:-1}" == "1" ]]; then
+            if try_auto_resolve_trivial_merge_conflicts; then
+              printf 'Auto-resolved trivial conflicts for %s; merge completed.\n' "$label"
+              merged_this_pass=$((merged_this_pass + 1))
+              if [[ -n "$pr_id_for_branch" ]]; then
+                resolve_party_conflict_comment_if_present \
+                  "$workspace" \
+                  "$repo_slug" \
+                  "$username" \
+                  "$app_password" \
+                  "$pr_id_for_branch" \
+                  "$party_branch_name" || true
+              fi
+              continue
+            fi
+          fi
+
           printf 'Merge conflict when merging %s: see git output above.\n' "$label" >&2
           printf 'Deferring %s for retry due to conflict.\n' "$label" >&2
 
