@@ -71,6 +71,30 @@ bitbucket_api_get() {
   printf '%s\n' "$body"
 }
 
+bitbucket_api_get_allow_fail() {
+  # Usage: bitbucket_api_get_allow_fail <url> <username> <app_password>
+  # Like bitbucket_api_get, but returns non-zero instead of exiting.
+  local url="$1"
+  local username="$2"
+  local app_password="$3"
+
+  local response http_code body
+  response=$(curl -sS -u "${username}:${app_password}" -w '\n%{http_code}' "$url") || {
+    printf 'Failed to call Bitbucket API at %s\n' "$url" >&2
+    return 1
+  }
+
+  http_code=${response##*$'\n'}
+  body=${response%$'\n'$http_code}
+
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    printf 'Bitbucket API error %s: %s\n' "$http_code" "$body" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$body"
+}
+
 bitbucket_api_request() {
   # Usage: bitbucket_api_request <method> <url> <username> <app_password> [json_body]
   local method="$1"
@@ -111,6 +135,46 @@ bitbucket_api_request() {
   printf '%s\n' "$body"
 }
 
+bitbucket_api_request_allow_fail() {
+  # Usage: bitbucket_api_request_allow_fail <method> <url> <username> <app_password> [json_body]
+  # Like bitbucket_api_request, but returns non-zero instead of exiting.
+  local method="$1"
+  local url="$2"
+  local username="$3"
+  local app_password="$4"
+  local json_body="${5:-}"
+
+  local -a curl_args=(
+    -sS
+    -u "${username}:${app_password}"
+    -w $'\n%{http_code}'
+    -X "$method"
+  )
+
+  if [[ -n "$json_body" ]]; then
+    curl_args+=(
+      -H 'Content-Type: application/json'
+      --data "$json_body"
+    )
+  fi
+
+  local response http_code body
+  response=$(curl "${curl_args[@]}" "$url") || {
+    printf 'Failed to call Bitbucket API (%s) at %s\n' "$method" "$url" >&2
+    return 1
+  }
+
+  http_code=${response##*$'\n'}
+  body=${response%$'\n'$http_code}
+
+  if [[ ! "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    printf 'Bitbucket API error %s: %s\n' "$http_code" "$body" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$body"
+}
+
 fetch_pr_comments() {
   # Usage: fetch_pr_comments <workspace> <repo_slug> <pr_id> <username> <app_password>
   local workspace="$1"
@@ -139,6 +203,35 @@ fetch_pr_comments() {
   printf '%s\n' "$all_comments"
 }
 
+fetch_pr_comments_allow_fail() {
+  # Usage: fetch_pr_comments_allow_fail <workspace> <repo_slug> <pr_id> <username> <app_password>
+  # Like fetch_pr_comments, but returns non-zero instead of exiting.
+  local workspace="$1"
+  local repo_slug="$2"
+  local pr_id="$3"
+  local username="$4"
+  local app_password="$5"
+
+  local url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments"
+  local all_comments='[]'
+
+  while [[ -n "$url" ]]; do
+    local page_json values_json
+    page_json=$(bitbucket_api_get_allow_fail "$url" "$username" "$app_password") || return 1
+
+    values_json=$(jq -c '.values // []' <<<"$page_json")
+    all_comments=$(
+      jq -sc 'add' \
+        <(printf '%s\n' "$all_comments") \
+        <(printf '%s\n' "$values_json")
+    )
+
+    url=$(jq -r '.next // empty' <<<"$page_json")
+  done
+
+  printf '%s\n' "$all_comments"
+}
+
 party_conflict_comment_marker() {
   printf '%s\n' '<!-- rebuild_party_branch:conflict -->'
 }
@@ -147,13 +240,24 @@ party_conflict_resolved_marker() {
   printf '%s\n' '<!-- rebuild_party_branch:conflict-resolved -->'
 }
 
-find_party_conflict_comment_id() {
-  # Usage: find_party_conflict_comment_id <comments_json>
+find_party_active_conflict_comment_ids() {
+  # Usage: find_party_active_conflict_comment_ids <comments_json>
+  # Returns IDs for conflict comments that have NOT been marked resolved.
   local comments_json="$1"
-  local marker
+  local marker resolved_marker
   marker=$(party_conflict_comment_marker)
+  resolved_marker=$(party_conflict_resolved_marker)
 
-  jq -r --arg marker "$marker" '[.[] | select(.content.raw and (.content.raw | contains($marker))) | .id] | first // empty' <<<"$comments_json"
+  jq -r --arg marker "$marker" --arg resolved "$resolved_marker" \
+    '.[] | select(.content.raw and (.content.raw | contains($marker)) and ((.content.raw | contains($resolved)) | not)) | .id' \
+    <<<"$comments_json"
+}
+
+find_party_active_conflict_comment_id() {
+  # Usage: find_party_active_conflict_comment_id <comments_json>
+  local comments_json="$1"
+
+  find_party_active_conflict_comment_ids "$comments_json" | head -n 1
 }
 
 strikeout_markdown_lines() {
@@ -525,21 +629,54 @@ upsert_party_conflict_comment() {
   local payload
   payload=$(jq -nc --arg raw "$comment_body" '{content:{raw:$raw}}')
 
-  local comments_json existing_comment_id
-  comments_json=$(fetch_pr_comments "$workspace" "$repo_slug" "$pr_id" "$username" "$app_password")
-  existing_comment_id=$(find_party_conflict_comment_id "$comments_json")
+  # If there is an existing conflict comment still in conflict, delete it and recreate a new
+  # comment so it floats to the top of the thread.
+  local comments_json
+  comments_json=$(fetch_pr_comments_allow_fail "$workspace" "$repo_slug" "$pr_id" "$username" "$app_password") || comments_json='[]'
 
-  if [[ -n "$existing_comment_id" ]]; then
-    local url
-    url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments/${existing_comment_id}"
-    bitbucket_api_request PUT "$url" "$username" "$app_password" "$payload" >/dev/null
-    printf 'Updated PR #%s conflict comment (comment id %s).\n' "$pr_id" "$existing_comment_id"
-    return 0
+  local -a existing_ids=()
+  mapfile -t existing_ids < <(find_party_active_conflict_comment_ids "$comments_json" || true)
+
+  if ((${#existing_ids[@]} > 0)); then
+    local -i deleted=0
+    local id url
+
+    for id in "${existing_ids[@]}"; do
+      [[ -z "$id" ]] && continue
+      url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments/${id}"
+      if bitbucket_api_request_allow_fail DELETE "$url" "$username" "$app_password" >/dev/null; then
+        deleted=$((deleted + 1))
+      fi
+    done
+
+    if ((deleted == ${#existing_ids[@]})); then
+      local create_url create_resp created_id
+      create_url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments"
+      create_resp=$(bitbucket_api_request_allow_fail POST "$create_url" "$username" "$app_password" "$payload") || return 1
+      created_id=$(jq -r '.id // empty' <<<"$create_resp")
+
+      if [[ -n "$created_id" ]]; then
+        printf 'Recreated PR #%s conflict comment (comment id %s).\n' "$pr_id" "$created_id"
+      else
+        printf 'Recreated PR #%s conflict comment.\n' "$pr_id"
+      fi
+      return 0
+    fi
+
+    # Could not delete all of them; fall back to updating the first one in place.
+    local fallback_id
+    fallback_id="${existing_ids[0]}"
+    if [[ -n "$fallback_id" ]]; then
+      url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments/${fallback_id}"
+      bitbucket_api_request_allow_fail PUT "$url" "$username" "$app_password" "$payload" >/dev/null || return 1
+      printf 'Updated PR #%s conflict comment (comment id %s).\n' "$pr_id" "$fallback_id"
+      return 0
+    fi
   fi
 
   local create_url create_resp created_id
   create_url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments"
-  create_resp=$(bitbucket_api_request POST "$create_url" "$username" "$app_password" "$payload")
+  create_resp=$(bitbucket_api_request_allow_fail POST "$create_url" "$username" "$app_password" "$payload") || return 1
   created_id=$(jq -r '.id // empty' <<<"$create_resp")
 
   if [[ -n "$created_id" ]]; then
@@ -547,6 +684,59 @@ upsert_party_conflict_comment() {
   else
     printf 'Created PR #%s conflict comment.\n' "$pr_id"
   fi
+}
+
+strip_party_conflict_details_for_resolved_comment() {
+  # Usage: strip_party_conflict_details_for_resolved_comment <raw_text>
+  # Removes the merge-conflict snippet section and footer markers so the resolved comment
+  # stays readable (and avoids weird strike-through formatting).
+  local raw_text="$1"
+
+  local out='' line
+  local -i skipping_context=0
+
+  while IFS= read -r line; do
+    # Drop markers and the AI footer; we'll add them back.
+    if [[ "$line" == '<!-- rebuild_party_branch:'* ]]; then
+      continue
+    fi
+
+    if [[ "$line" == '_(Automated comment created by an AI agent; not written by Joey.)_' ]]; then
+      continue
+    fi
+
+    # Drop the old header and timestamp to reduce noise.
+    if [[ "$line" == '**Party branch rebuild skipped this PR due to merge conflicts**' ]]; then
+      continue
+    fi
+
+    if [[ "$line" == "- Time (UTC):"* ]]; then
+      continue
+    fi
+
+    # Remove the conflict context section entirely (it contains the inline conflict markers).
+    if ((skipping_context == 1)); then
+      if [[ "$line" == 'Please resolve conflicts by updating the PR branch so it can be included in the party branch.' ]]; then
+        skipping_context=0
+      fi
+      continue
+    fi
+
+    if [[ "$line" == 'Conflict context (first conflict per file):' ]]; then
+      skipping_context=1
+      out+=$'Conflict context: _(removed after resolution to keep formatting clean)_\n'
+      continue
+    fi
+
+    # This instruction doesn't apply after resolution.
+    if [[ "$line" == 'Please resolve conflicts by updating the PR branch so it can be included in the party branch.' ]]; then
+      continue
+    fi
+
+    out+="$line"$'\n'
+  done <<<"$raw_text"
+
+  printf '%s' "$out"
 }
 
 resolve_party_conflict_comment_if_present() {
@@ -563,8 +753,8 @@ resolve_party_conflict_comment_if_present() {
   resolved_marker=$(party_conflict_resolved_marker)
 
   local comments_json existing_comment_id existing_raw
-  comments_json=$(fetch_pr_comments "$workspace" "$repo_slug" "$pr_id" "$username" "$app_password")
-  existing_comment_id=$(find_party_conflict_comment_id "$comments_json")
+  comments_json=$(fetch_pr_comments_allow_fail "$workspace" "$repo_slug" "$pr_id" "$username" "$app_password") || return 1
+  existing_comment_id=$(find_party_active_conflict_comment_id "$comments_json")
 
   [[ -z "$existing_comment_id" ]] && return 0
 
@@ -575,16 +765,16 @@ resolve_party_conflict_comment_if_present() {
     return 0
   fi
 
-  local now struck
+  local now previous_clean
   now=$(now_utc)
-  struck=$(strikeout_markdown_lines "$existing_raw")
+  previous_clean=$(strip_party_conflict_details_for_resolved_comment "$existing_raw")
 
   local new_body
   new_body=$(
     printf '%s\n' \
       "Resolved: this PR now merges cleanly into \`$party_branch\` as of \`$now\`." \
       '' \
-      "$struck" \
+      "$previous_clean" \
       '' \
       '_(Automated comment created by an AI agent; not written by Joey.)_' \
       "$marker" \
@@ -594,7 +784,7 @@ resolve_party_conflict_comment_if_present() {
   local payload url
   payload=$(jq -nc --arg raw "$new_body" '{content:{raw:$raw}}')
   url="https://api.bitbucket.org/2.0/repositories/${workspace}/${repo_slug}/pullrequests/${pr_id}/comments/${existing_comment_id}"
-  bitbucket_api_request PUT "$url" "$username" "$app_password" "$payload" >/dev/null
+  bitbucket_api_request_allow_fail PUT "$url" "$username" "$app_password" "$payload" >/dev/null || return 1
 
   printf 'Marked PR #%s conflict comment as resolved (comment id %s).\n' "$pr_id" "$existing_comment_id"
 }
