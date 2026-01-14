@@ -951,8 +951,9 @@ main() {
     shell "git status --short || true"
 
     # Ensure a clean working tree for this base branch.
+    # Keep conflict report files so they can be uploaded as CI artifacts.
     shell 'git reset --hard'
-    shell 'git clean -fd'
+    shell 'git clean -fd -e conflict-reports -e conflict-reports/**'
 
     # checkout/reset party branch from origin/<base>
     shell "git checkout -B '$party_branch_name' 'origin/$base_branch_name'"
