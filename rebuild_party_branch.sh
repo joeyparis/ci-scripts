@@ -15,6 +15,11 @@ set -euo pipefail
 #   BITBUCKET_REPO_SLUG
 #   BB_USERNAME
 #   BB_APP_PASSWORD
+#
+# Optional environment variables:
+#   REBUILD_PARTY_BRANCH_STATUS_MD_PATH
+#     - Path to the status markdown file (committed only to the party branch).
+#     - Default: party_merge_status.md
 
 now_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
@@ -230,6 +235,11 @@ fetch_pr_comments_allow_fail() {
   done
 
   printf '%s\n' "$all_comments"
+}
+
+party_status_md_path() {
+  # Status file is committed ONLY on the party branch.
+  printf '%s\n' "${REBUILD_PARTY_BRANCH_STATUS_MD_PATH:-party_merge_status.md}"
 }
 
 party_conflict_comment_marker() {
@@ -845,6 +855,7 @@ main() {
   require_cmd git
   require_cmd curl
   require_cmd jq
+  require_cmd sort
 
   # Ensure the conflict-report directory exists so pipelines can always collect it as an artifact.
   mkdir -p conflict-reports
@@ -979,6 +990,9 @@ main() {
       pending_head_branches=($head_branches)
     fi
 
+    local -a merged_head_branches=()
+    declare -A branch_failure_reason=()
+
     local -i pass_num=0
     local head_branch merge_ref pr_id_for_branch label
 
@@ -1009,14 +1023,21 @@ main() {
         printf 'Merging %s into %s...\n' "$label" "$party_branch_name"
 
         if ! shell_allow_fail "git merge --no-ff --no-edit '$merge_ref'"; then
-          printf 'Merge conflict when merging %s: see git output above.\n' "$label" >&2
-          printf 'Deferring %s for retry due to conflict.\n' "$label" >&2
+          printf 'Merge failed when merging %s: see git output above.\n' "$label" >&2
+          printf 'Deferring %s for retry due to failure.\n' "$label" >&2
 
-          # Only comment when Git indicates actual file-level merge conflicts.
+          local failure_reason
+          if [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
+            failure_reason='merge conflict'
+          else
+            failure_reason='merge failed (non-conflict)'
+          fi
+
+          # Keep a per-PR conflict report as a CI artifact when possible, but do not post PR comments.
           local conflict_files
           conflict_files=$(git --no-pager diff --name-only --diff-filter=U 2>/dev/null || true)
 
-          if [[ -n "$pr_id_for_branch" ]] && [[ -n "$(git ls-files -u 2>/dev/null || true)" ]]; then
+          if [[ -n "$pr_id_for_branch" ]] && [[ "$failure_reason" == 'merge conflict' ]]; then
             write_party_conflict_report_for_pr \
               "$pr_id_for_branch" \
               "$base_branch_name" \
@@ -1024,34 +1045,17 @@ main() {
               "$head_branch" \
               "$merge_ref" \
               "$conflict_files" || true
-
-            upsert_party_conflict_comment \
-              "$workspace" \
-              "$repo_slug" \
-              "$username" \
-              "$app_password" \
-              "$pr_id_for_branch" \
-              "$base_branch_name" \
-              "$party_branch_name" \
-              "$head_branch" \
-              "$merge_ref" \
-              "$conflict_files" || true
           fi
+
+          # Record the last failure reason for status reporting.
+          branch_failure_reason["$head_branch"]="$failure_reason"
 
           # Abort the merge and try the next branch.
           git merge --abort || true
           next_pending+=("$head_branch")
         else
           merged_this_pass=$((merged_this_pass + 1))
-          if [[ -n "$pr_id_for_branch" ]]; then
-            resolve_party_conflict_comment_if_present \
-              "$workspace" \
-              "$repo_slug" \
-              "$username" \
-              "$app_password" \
-              "$pr_id_for_branch" \
-              "$party_branch_name" || true
-          fi
+          merged_head_branches+=("$head_branch")
         fi
       done
 
@@ -1078,6 +1082,63 @@ main() {
         printf '  - %s\n' "$label"
       done
       printf '%s\n' '=================================================='
+    fi
+
+    # Write a single status markdown file (committed only on the party branch) listing
+    # which PR branches were merged and which were not.
+    local status_md
+    status_md=$(party_status_md_path)
+
+    mkdir -p "$(dirname "$status_md")" 2>/dev/null || true
+
+    {
+      printf '%s\n' '# Party branch merge status'
+      printf '%s\n' ''
+      printf -- '- Base branch: `%s`\n' "$base_branch_name"
+      printf -- '- Party branch: `%s`\n' "$party_branch_name"
+      printf '%s\n' ''
+
+      printf '%s\n' '## Merged'
+      if ((${#merged_head_branches[@]} == 0)); then
+        printf '%s\n' '_None._'
+      else
+        # Stable ordering to reduce churn.
+        while IFS= read -r head_branch; do
+          [[ -z "$head_branch" ]] && continue
+          pr_id_for_branch=${branch_to_pr_id["$head_branch"]:-}
+          if [[ -n "$pr_id_for_branch" ]]; then
+            printf -- '- PR #%s — `%s`\n' "$pr_id_for_branch" "$head_branch"
+          else
+            printf -- '- `%s`\n' "$head_branch"
+          fi
+        done < <(printf '%s\n' "${merged_head_branches[@]}" | LC_ALL=C sort)
+      fi
+
+      printf '%s\n' ''
+      printf '%s\n' '## Not merged'
+      if ((${#pending_head_branches[@]} == 0)); then
+        printf '%s\n' '_None._'
+      else
+        while IFS= read -r head_branch; do
+          [[ -z "$head_branch" ]] && continue
+          pr_id_for_branch=${branch_to_pr_id["$head_branch"]:-}
+          local reason
+          reason=${branch_failure_reason["$head_branch"]:-'merge conflict'}
+          if [[ -n "$pr_id_for_branch" ]]; then
+            printf -- '- PR #%s — `%s` (%s)\n' "$pr_id_for_branch" "$head_branch" "$reason"
+          else
+            printf -- '- `%s` (%s)\n' "$head_branch" "$reason"
+          fi
+        done < <(printf '%s\n' "${pending_head_branches[@]}" | LC_ALL=C sort)
+      fi
+
+      printf '%s\n' ''
+      printf '%s\n' '_Generated by rebuild_party_branch.sh_'
+    } >"$status_md"
+
+    if [[ -n "$(git status --porcelain=v1 -- "$status_md" 2>/dev/null || true)" ]]; then
+      git add "$status_md"
+      git commit -m "Update party merge status" >/dev/null
     fi
 
     # Force push party branch for this base.
